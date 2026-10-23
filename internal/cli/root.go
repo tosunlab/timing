@@ -113,7 +113,7 @@ func (a *app) rootCommand() *cobra.Command {
 	pf.StringVar(&a.db, "db", "", "database path (env TIMING_DB)")
 	pf.StringVar(&a.project, "project", "", "project name (env TIMING_PROJECT)")
 	pf.BoolVar(&a.json, "json", false, "print JSON")
-	root.AddCommand(a.startCmd(), a.stopCmd(), a.tokensCmd(), a.amendCmd(), a.statusCmd(), a.logCmd(), a.reportCmd())
+	root.AddCommand(a.startCmd(), a.stopCmd(), a.tokensCmd(), a.amendCmd(), a.statusCmd(), a.logCmd(), a.reportCmd(), a.hookCmd())
 	return root
 }
 
@@ -148,14 +148,14 @@ func (a *app) dbPath() string {
 	return filepath.Join(a.io.Env("HOME"), ".local", "share", "timing", "timing.db")
 }
 
-func (a *app) resolveProject() string {
+func (a *app) resolveProject(cwd string) string {
 	if a.project != "" {
 		return a.project
 	}
 	if p := a.io.Env("TIMING_PROJECT"); p != "" {
 		return p
 	}
-	for dir := a.io.Cwd; ; {
+	for dir := cwd; ; {
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			return filepath.Base(dir)
 		}
@@ -165,7 +165,7 @@ func (a *app) resolveProject() string {
 		}
 		dir = parent
 	}
-	return filepath.Base(a.io.Cwd)
+	return filepath.Base(cwd)
 }
 
 func resolvePrefix(st *store.Store, prefix string) (store.SessionID, error) {
@@ -189,7 +189,7 @@ func (a *app) resolveSession(st *store.Store, flag string) (store.SessionID, err
 		return resolvePrefix(st, prefix)
 	}
 
-	project := a.resolveProject()
+	project := a.resolveProject(a.io.Cwd)
 	open, err := st.List(store.Filter{Project: project, OpenOnly: true})
 	if err != nil {
 		return "", err
