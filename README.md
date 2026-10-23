@@ -89,6 +89,7 @@ A session object, printed by `start`, `amend`, `stop` and `tokens` and listed by
 }
 ```
 
+- `external_id` is the Claude Code session id for sessions created by `timing hook`. It is omitted otherwise.
 - `end` is null while the session is open.
 - `seconds` is the elapsed time so far for an open session.
 - `tokens` is the sum over all models. `models` is keyed by model name, and usage recorded without a model uses the empty string.
@@ -114,43 +115,26 @@ Errors go to stderr as `timing: <message>`.
 
 ## Agent integration
 
-A Claude Code `Stop` hook can record the usage of the turn that just finished. This script reads the hook payload, sums the usage of every assistant message since the last human message in the transcript, and pipes the result into `timing tokens --stdin-json`. Save it as `~/.claude/hooks/timing-tokens.sh` and make it executable.
+`timing hook install` registers `timing hook` for the Claude Code events SessionStart, UserPromptSubmit, Stop and SessionEnd. After that, every Claude Code session is tracked with no further setup.
 
 ```
-#!/bin/sh
-transcript=$(jq -r '.transcript_path')
-jq -s -c '
-  (to_entries
-    | map(select(.value.type == "user" and ((.value.message.content | type) == "string"
-        or ((.value.message.content | type) == "array" and .value.message.content[0].type == "text"))))
-    | last | .key) as $human
-  | .[$human + 1:] | map(select(.type == "assistant" and .message.usage))
-  | {
-      model: (last.message.model),
-      input: (map(.message.usage.input_tokens) | add // 0),
-      output: (map(.message.usage.output_tokens) | add // 0),
-      cache_read: (map(.message.usage.cache_read_input_tokens // 0) | add // 0),
-      cache_write: (map(.message.usage.cache_creation_input_tokens // 0) | add // 0)
-    }' "$transcript" |
-  timing tokens --stdin-json
+$ timing hook install
+added SessionStart
+added UserPromptSubmit
+added Stop
+added SessionEnd
 ```
 
-Tool results are also stored as `user` entries, so the filter treats only entries with text content as human messages. Each API call in a turn carries its own `input_tokens`, so the sum is the turn's total.
+The command edits `~/.claude/settings.json`, or the file given by `--settings`. It keeps your other settings, adds an entry only when `timing hook` is not already registered for that event, and prints "already installed" when there is nothing to add. It re-indents the file and sorts its keys. The SessionEnd entry has `"timeout": 10`, because Claude Code gives SessionEnd hooks 1.5 seconds by default and reading a large transcript can take longer.
 
-Register it in `~/.claude/settings.json`:
+`timing hook` reads the hook payload on stdin and prints nothing. It matches timing sessions to Claude Code sessions by `session_id`, stored as `external_id`, and never uses the single-open-session fallback.
 
-```
-{
-  "hooks": {
-    "Stop": [{"hooks": [{"type": "command", "command": "~/.claude/hooks/timing-tokens.sh"}]}]
-  }
-}
-```
+- SessionStart opens a session unless the newest one for this `session_id` is already open. Resuming a session that has ended starts a new segment.
+- UserPromptSubmit sets the task to the first line of the prompt, cut to 80 characters, when the session has no task yet. Prompts that start with `/` are skipped.
+- Stop reads the transcript and the subagent transcripts in `<transcript dir>/<session_id>/subagents/`, and records the usage of each API response once. Running it again records nothing new. A message that the transcript had not yet written at Stop is picked up by the next Stop or by SessionEnd.
+- SessionEnd records usage the same way, then stops the session.
+- Any other event is ignored.
 
-Start the session at the beginning of the work and export its id so the hook finds it:
+The project comes from the payload's `cwd`, or from `TIMING_PROJECT` when set. The agent is `TIMING_AGENT`, or "claude-code". Usage rows carry the model that produced them and the time of the message, so `report --by model` and `--by day` work.
 
-```
-export TIMING_SESSION=$(timing start --agent claude-code --task "fix auth bug")
-```
-
-When several agents share a project, always set `TIMING_SESSION` or pass `--session`. Without it the hook fails with exit code 2 rather than record usage against the wrong session.
+`timing hook` exits 0 on success and for events it ignores, and 1 on any error. It never exits 2, because exit 2 from a Stop hook stops Claude Code from finishing. The whole transcript is read on each Stop, so a very large transcript can make SessionEnd exceed its timeout. Records already written stay, and the next ingest completes the rest.

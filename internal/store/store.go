@@ -42,6 +42,11 @@ var migrations = []string{
 	  recorded_at TEXT NOT NULL
 	);
 	CREATE INDEX token_usage_session ON token_usage(session_id);`,
+	// SQLite allows many NULLs in a unique index, so manual usage rows (NULL source_id) never conflict.
+	`ALTER TABLE sessions ADD COLUMN external_id TEXT NOT NULL DEFAULT '';
+	CREATE INDEX sessions_external ON sessions(external_id, started_at);
+	ALTER TABLE token_usage ADD COLUMN source_id TEXT;
+	CREATE UNIQUE INDEX token_usage_source ON token_usage(source_id);`,
 }
 
 type Store struct {

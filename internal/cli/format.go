@@ -77,29 +77,31 @@ func toTokensJSON(u store.Usage) tokensJSON {
 }
 
 type sessionJSON struct {
-	ID      string                `json:"id"`
-	Project string                `json:"project"`
-	Agent   string                `json:"agent"`
-	Task    string                `json:"task"`
-	Start   string                `json:"start"`
-	End     *string               `json:"end"`
-	Open    bool                  `json:"open"`
-	Seconds int64                 `json:"seconds"`
-	Tokens  tokensJSON            `json:"tokens"`
-	Models  map[string]tokensJSON `json:"models"`
+	ID         string                `json:"id"`
+	ExternalID string                `json:"external_id,omitempty"`
+	Project    string                `json:"project"`
+	Agent      string                `json:"agent"`
+	Task       string                `json:"task"`
+	Start      string                `json:"start"`
+	End        *string               `json:"end"`
+	Open       bool                  `json:"open"`
+	Seconds    int64                 `json:"seconds"`
+	Tokens     tokensJSON            `json:"tokens"`
+	Models     map[string]tokensJSON `json:"models"`
 }
 
 func toSessionJSON(s store.Session, now time.Time) sessionJSON {
 	j := sessionJSON{
-		ID:      string(s.ID),
-		Project: s.Project,
-		Agent:   s.Agent,
-		Task:    s.Task,
-		Start:   s.Start.Format(time.RFC3339),
-		Open:    s.Open(),
-		Seconds: seconds(s.Duration(now)),
-		Tokens:  toTokensJSON(s.TotalUsage()),
-		Models:  map[string]tokensJSON{},
+		ID:         string(s.ID),
+		ExternalID: s.ExternalID,
+		Project:    s.Project,
+		Agent:      s.Agent,
+		Task:       s.Task,
+		Start:      s.Start.Format(time.RFC3339),
+		Open:       s.Open(),
+		Seconds:    seconds(s.Duration(now)),
+		Tokens:     toTokensJSON(s.TotalUsage()),
+		Models:     map[string]tokensJSON{},
 	}
 	if !s.Open() {
 		e := s.End.Format(time.RFC3339)

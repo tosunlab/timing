@@ -90,7 +90,7 @@ func (a *app) startCmd() *cobra.Command {
 			if agent == "" {
 				agent = "unknown"
 			}
-			n := store.NewSession{ID: a.io.NewID(), Project: a.resolveProject(), Agent: agent, Task: task, Start: a.io.Now()}
+			n := store.NewSession{ID: a.io.NewID(), Project: a.resolveProject(a.io.Cwd), Agent: agent, Task: task, Start: a.io.Now()}
 			return a.withStore(func(st *store.Store) error {
 				if err := st.Start(n); err != nil {
 					return err

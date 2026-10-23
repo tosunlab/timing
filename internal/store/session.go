@@ -25,13 +25,14 @@ func (u Usage) valid() bool {
 }
 
 type Session struct {
-	ID      SessionID
-	Project string
-	Agent   string
-	Task    string
-	Start   time.Time
-	End     time.Time // zero => open
-	Usage   map[string]Usage
+	ID         SessionID
+	ExternalID string
+	Project    string
+	Agent      string
+	Task       string
+	Start      time.Time
+	End        time.Time // zero => open
+	Usage      map[string]Usage
 }
 
 func (s Session) Open() bool { return s.End.IsZero() }
@@ -53,15 +54,21 @@ func (s Session) TotalUsage() Usage {
 
 type NewSession struct {
 	ID                   SessionID
+	ExternalID           string
 	Project, Agent, Task string
 	Start                time.Time
 }
 
+// SourceID identifies the origin of an automatically ingested row. A second row with the same
+// SourceID is dropped. Empty means a manual row, which is never deduplicated.
 type UsageRecord struct {
-	Model string
-	Usage Usage
-	At    time.Time
+	Model    string
+	Usage    Usage
+	At       time.Time
+	SourceID string
 }
+
+const usageBatchSize = 500
 
 // Amendment fields left nil are unchanged.
 type Amendment struct {
@@ -88,8 +95,8 @@ func parseTime(s string) (time.Time, error) {
 }
 
 func (s *Store) Start(n NewSession) error {
-	_, err := s.db.Exec(`INSERT INTO sessions (id, project, agent, task, started_at) VALUES (?, ?, ?, ?, ?)`,
-		string(n.ID), n.Project, n.Agent, n.Task, formatTime(n.Start))
+	_, err := s.db.Exec(`INSERT INTO sessions (id, external_id, project, agent, task, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		string(n.ID), n.ExternalID, n.Project, n.Agent, n.Task, formatTime(n.Start))
 	return err
 }
 
@@ -109,7 +116,7 @@ func (s *Store) Stop(id SessionID, at time.Time, usage *UsageRecord) error {
 			return fmt.Errorf("%w: end %s is before start %s", ErrInvalid, formatTime(at), formatTime(start))
 		}
 		if usage != nil {
-			if err := insertUsage(tx, id, UsageRecord{Model: usage.Model, Usage: usage.Usage, At: at}); err != nil {
+			if _, err := insertUsage(tx, id, UsageRecord{Model: usage.Model, Usage: usage.Usage, At: at}); err != nil {
 				return err
 			}
 		}
@@ -130,8 +137,61 @@ func (s *Store) RecordUsage(id SessionID, u UsageRecord) error {
 		if !end.IsZero() {
 			return ErrClosed
 		}
-		return insertUsage(tx, id, u)
+		_, err = insertUsage(tx, id, u)
+		return err
 	})
+}
+
+// RecordUsageBatch drops records whose SourceID is already stored and returns how many rows it
+// inserted. Each batch of 500 commits on its own, so a crash leaves a prefix that a rerun completes.
+func (s *Store) RecordUsageBatch(id SessionID, recs []UsageRecord) (inserted int, err error) {
+	for _, r := range recs {
+		if !r.Usage.valid() {
+			return 0, fmt.Errorf("%w: negative token count", ErrInvalid)
+		}
+	}
+	for len(recs) > 0 {
+		batch := recs[:min(len(recs), usageBatchSize)]
+		recs = recs[len(batch):]
+		err := s.tx(func(tx *sql.Tx) error {
+			_, end, err := sessionBounds(tx, id)
+			if err != nil {
+				return err
+			}
+			if !end.IsZero() {
+				return ErrClosed
+			}
+			for _, r := range batch {
+				added, err := insertUsage(tx, id, r)
+				if err != nil {
+					return err
+				}
+				if added {
+					inserted++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return inserted, err
+		}
+	}
+	return inserted, nil
+}
+
+// Newest returns the most recently started session with this external id.
+func (s *Store) Newest(externalID string) (Session, error) {
+	if externalID == "" {
+		return Session{}, ErrNotFound
+	}
+	sessions, err := s.query(`WHERE external_id = ?`, []any{externalID}, 1)
+	if err != nil {
+		return Session{}, err
+	}
+	if len(sessions) == 0 {
+		return Session{}, ErrNotFound
+	}
+	return sessions[0], nil
 }
 
 func (s *Store) Amend(id SessionID, a Amendment) error {
@@ -246,7 +306,7 @@ func (s *Store) List(f Filter) ([]Session, error) {
 }
 
 func (s *Store) query(where string, args []any, limit int) ([]Session, error) {
-	q := `SELECT id, project, agent, task, started_at, ended_at FROM sessions ` + where
+	q := `SELECT id, external_id, project, agent, task, started_at, ended_at FROM sessions ` + where
 	if limit > 0 {
 		q = `SELECT * FROM (` + q + ` ORDER BY started_at DESC, id DESC LIMIT ` + fmt.Sprint(limit) + `)`
 	}
@@ -261,7 +321,7 @@ func (s *Store) query(where string, args []any, limit int) ([]Session, error) {
 		var sess Session
 		var start string
 		var end sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Project, &sess.Agent, &sess.Task, &start, &end); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.ExternalID, &sess.Project, &sess.Agent, &sess.Task, &start, &end); err != nil {
 			return nil, err
 		}
 		if sess.Start, err = parseTime(start); err != nil {
@@ -322,9 +382,19 @@ func sessionBounds(tx *sql.Tx, id SessionID) (start, end time.Time, err error) {
 	return
 }
 
-func insertUsage(tx *sql.Tx, id SessionID, u UsageRecord) error {
-	_, err := tx.Exec(`INSERT INTO token_usage (session_id, model, input, output, cache_read, cache_write, recorded_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		string(id), u.Model, u.Usage.Input, u.Usage.Output, u.Usage.CacheRead, u.Usage.CacheWrite, formatTime(u.At))
-	return err
+// Reports false when the row was dropped because its SourceID is already stored. ON CONFLICT
+// names the one constraint to tolerate, where OR IGNORE would also swallow CHECK violations.
+func insertUsage(tx *sql.Tx, id SessionID, u UsageRecord) (bool, error) {
+	var source any
+	if u.SourceID != "" {
+		source = u.SourceID
+	}
+	res, err := tx.Exec(`INSERT INTO token_usage (session_id, model, input, output, cache_read, cache_write, recorded_at, source_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO NOTHING`,
+		string(id), u.Model, u.Usage.Input, u.Usage.Output, u.Usage.CacheRead, u.Usage.CacheWrite, formatTime(u.At), source)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }

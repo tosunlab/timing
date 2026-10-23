@@ -17,7 +17,7 @@ type scopeFlags struct {
 func (a *app) filter(sf scopeFlags, now time.Time) (store.Filter, error) {
 	var f store.Filter
 	if !sf.all {
-		f.Project = a.resolveProject()
+		f.Project = a.resolveProject(a.io.Cwd)
 	}
 	if sf.since != "" {
 		t, err := parseTime(sf.since, now)
