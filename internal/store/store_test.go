@@ -316,3 +316,98 @@ func TestUsageArithmetic(t *testing.T) {
 		t.Error("Total or IsZero wrong")
 	}
 }
+
+func TestRecordUsageBatchDeduplicatesBySource(t *testing.T) {
+	s, _ := open(t)
+	id := start(t, s, "s_aaaa0001", "proj", t0)
+	other := start(t, s, "s_aaaa0002", "proj", t0)
+	rec := func(source string, in int64) store.UsageRecord {
+		return store.UsageRecord{Model: "m", Usage: store.Usage{Input: in}, At: t0.Add(time.Minute), SourceID: source}
+	}
+
+	n, err := s.RecordUsageBatch(id, []store.UsageRecord{rec("a", 1), rec("b", 2), rec("a", 100)})
+	if err != nil || n != 2 {
+		t.Fatalf("first batch: inserted %d, err %v; want 2", n, err)
+	}
+	n, err = s.RecordUsageBatch(id, []store.UsageRecord{rec("a", 1), rec("b", 2), rec("c", 4)})
+	if err != nil || n != 1 {
+		t.Fatalf("second batch: inserted %d, err %v; want 1", n, err)
+	}
+	n, err = s.RecordUsageBatch(other, []store.UsageRecord{rec("c", 4)})
+	if err != nil || n != 0 {
+		t.Fatalf("same source on another session: inserted %d, err %v; want 0", n, err)
+	}
+
+	got, _ := s.Get(id)
+	if u := got.Usage["m"]; u.Input != 7 {
+		t.Errorf("input = %d, want 7", u.Input)
+	}
+
+	// Empty SourceID is a manual row and never deduplicated.
+	n, err = s.RecordUsageBatch(id, []store.UsageRecord{rec("", 1), rec("", 1)})
+	if err != nil || n != 2 {
+		t.Fatalf("manual rows: inserted %d, err %v; want 2", n, err)
+	}
+}
+
+func TestRecordUsageBatchSpansTransactions(t *testing.T) {
+	s, _ := open(t)
+	id := start(t, s, "s_aaaa0001", "proj", t0)
+	var recs []store.UsageRecord
+	for i := range 1203 {
+		recs = append(recs, store.UsageRecord{Model: "m", Usage: store.Usage{Output: 1}, At: t0, SourceID: fmt.Sprintf("msg_%d", i)})
+	}
+	n, err := s.RecordUsageBatch(id, recs)
+	if err != nil || n != 1203 {
+		t.Fatalf("inserted %d, err %v; want 1203", n, err)
+	}
+	if n, err = s.RecordUsageBatch(id, recs); err != nil || n != 0 {
+		t.Fatalf("rerun: inserted %d, err %v; want 0", n, err)
+	}
+}
+
+func TestRecordUsageBatchRejections(t *testing.T) {
+	s, _ := open(t)
+	id := start(t, s, "s_aaaa0001", "proj", t0)
+	good := store.UsageRecord{Model: "m", Usage: store.Usage{Input: 1}, At: t0, SourceID: "ok"}
+	bad := store.UsageRecord{Model: "m", Usage: store.Usage{Input: -1}, At: t0, SourceID: "bad"}
+
+	if _, err := s.RecordUsageBatch(id, []store.UsageRecord{good, bad}); !errors.Is(err, store.ErrInvalid) {
+		t.Errorf("negative count: err %v, want ErrInvalid", err)
+	}
+	if got, _ := s.Get(id); !got.TotalUsage().IsZero() {
+		t.Errorf("rejected batch left usage %+v", got.TotalUsage())
+	}
+	if _, err := s.RecordUsageBatch("s_missing0", []store.UsageRecord{good}); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown session: err %v, want ErrNotFound", err)
+	}
+	if err := s.Stop(id, t0.Add(time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordUsageBatch(id, []store.UsageRecord{good}); !errors.Is(err, store.ErrClosed) {
+		t.Errorf("closed session: err %v, want ErrClosed", err)
+	}
+}
+
+func TestNewestByExternalID(t *testing.T) {
+	s, _ := open(t)
+	if _, err := s.Newest("x"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("empty store: err %v, want ErrNotFound", err)
+	}
+	for i, id := range []string{"s_aaaa0001", "s_aaaa0002", "s_aaaa0003"} {
+		ext := "ext-1"
+		if i == 2 {
+			ext = ""
+		}
+		if err := s.Start(store.NewSession{ID: store.SessionID(id), ExternalID: ext, Project: "p", Agent: "a", Start: t0.Add(time.Duration(i) * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Newest("ext-1")
+	if err != nil || got.ID != "s_aaaa0002" || got.ExternalID != "ext-1" {
+		t.Errorf("Newest(ext-1) = %+v, %v; want s_aaaa0002", got, err)
+	}
+	if _, err := s.Newest(""); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Newest(\"\"): err %v, want ErrNotFound", err)
+	}
+}
